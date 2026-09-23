@@ -109,6 +109,8 @@ ComfyUI/output/h3-lvm/<project_name>/
 | `project_name` | H3_LVM | Bin folder name |
 | `save_enabled` | true | Save to bin (disable for pure-live mode) |
 | `save_preview_mp4` | false | Also encode MP4 preview |
+| `person_crop` | false | Detect person and crop edges so the subject fills more of the frame |
+| `person_crop_expand_percent` | 0 | Extra padding around the person box, 0–100. 0 = tight (still keeps source aspect) |
 
 #### H3 Segment Picker
 
@@ -264,6 +266,8 @@ ComfyUI/output/h3-lvm/<项目名>/
 | `project_name` | H3_LVM | 库文件夹名 |
 | `save_enabled` | true | 是否存库（关 = 纯实时模式） |
 | `save_preview_mp4` | false | 是否生成 MP4 预览 |
+| `person_crop` | false | 开启后检测人物并裁掉边缘，让主体占画面更大 |
+| `person_crop_expand_percent` | 0 | 人物框外扩百分比（0–100）。0 = 紧贴检测框，仍保持原画面比例 |
 
 #### H3 Segment Picker
 
