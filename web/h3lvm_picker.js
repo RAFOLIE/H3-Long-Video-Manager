@@ -6,6 +6,7 @@
  * - Renders cards with thumbnails, frame count, duration
  * - Click card → sets segment_id widget
  * - Refresh button
+ * - Zoom controls (+/− 100%~400%)
  * - Optional mp4 preview (click ▶ on card if available)
  *
  * Namespace: H3.LVM.*  (no conflict with clipstream MiniMaxH3.*)
@@ -40,9 +41,17 @@ app.registerExtension({
     async beforeRegisterNodeDef(nodeType, nodeData, appInstance) {
         if (nodeData.name !== "H3 Segment Picker") return;
 
+        // Prevent node from shrinking below usable size
+        nodeType.prototype.min_size = [320, 200];
+
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
+            this.imgs = null;
+            // Enforce minimum size so cards are visible
+            if (this.size[0] < 320 || this.size[1] < 200) {
+                this.setSize([Math.max(this.size[0], 320), Math.max(this.size[1], 200)]);
+            }
             try {
                 setupPickerUI(this);
             } catch (e) {
@@ -54,9 +63,20 @@ app.registerExtension({
         const onConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function () {
             const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+            this.imgs = null;
             this._h3lvm_gallery = null;
             return r;
         };
+
+        const onExecuted = nodeType.prototype.onExecuted;
+        nodeType.prototype.onExecuted = function (message) {
+            const r = onExecuted ? onExecuted.apply(this, arguments) : undefined;
+            this.imgs = null;
+            return r;
+        };
+
+        // Prevent auto-resize for image previews
+        nodeType.prototype.setSizeForImage = function () {};
     }
 });
 
@@ -73,6 +93,11 @@ function setupPickerUI(node) {
     const header = document.createElement("div");
     header.className = "h3lvm-header";
 
+    const titleWrap = document.createElement("div");
+    titleWrap.style.display = "flex";
+    titleWrap.style.alignItems = "center";
+    titleWrap.style.gap = "6px";
+
     const titleSpan = document.createElement("span");
     titleSpan.className = "h3lvm-title";
     titleSpan.textContent = "📦 H3 Segment Bin";
@@ -81,15 +106,66 @@ function setupPickerUI(node) {
     projectTag.className = "h3lvm-project-tag";
     projectTag.textContent = projectWidget?.value || "H3_LVM";
 
+    titleWrap.appendChild(titleSpan);
+    titleWrap.appendChild(projectTag);
+
+    // Actions: refresh + zoom
+    const actionsWrap = document.createElement("div");
+    actionsWrap.className = "h3lvm-actions";
+
     const refreshBtn = document.createElement("button");
     refreshBtn.className = "h3lvm-refresh-btn";
-    refreshBtn.textContent = "🔄";
+    refreshBtn.textContent = "🔄 刷新";
     refreshBtn.title = "刷新列表";
 
-    header.appendChild(titleSpan);
-    header.appendChild(projectTag);
-    header.appendChild(refreshBtn);
+    // Zoom controls
+    const zoomLabel = document.createElement("span");
+    zoomLabel.className = "h3lvm-zoom-label";
+    zoomLabel.textContent = "100%";
+
+    const btnZoomIn = document.createElement("button");
+    btnZoomIn.className = "h3lvm-refresh-btn";
+    btnZoomIn.textContent = "+";
+    btnZoomIn.title = "放大卡片";
+
+    const btnZoomOut = document.createElement("button");
+    btnZoomOut.className = "h3lvm-refresh-btn";
+    btnZoomOut.textContent = "−";
+    btnZoomOut.title = "缩小卡片";
+
+    actionsWrap.appendChild(refreshBtn);
+    actionsWrap.appendChild(btnZoomOut);
+    actionsWrap.appendChild(zoomLabel);
+    actionsWrap.appendChild(btnZoomIn);
+
+    header.appendChild(titleWrap);
+    header.appendChild(actionsWrap);
     container.appendChild(header);
+
+    // --- Card Zoom State ---
+    const ZOOM_STEPS = [1, 1.5, 2, 3, 4]; // 100%, 150%, 200%, 300%, 400%
+    let zoomIdx = 0;
+    const BASE_CARD_MIN = 130; // px
+    const BASE_THUMB_H = 75;   // px
+
+    function applyCardZoom() {
+        const z = ZOOM_STEPS[zoomIdx];
+        const cardMin = Math.round(BASE_CARD_MIN * z);
+        const thumbH = Math.round(BASE_THUMB_H * z);
+        container.style.setProperty("--card-min", cardMin + "px");
+        container.style.setProperty("--thumb-h", thumbH + "px");
+        zoomLabel.textContent = Math.round(z * 100) + "%";
+        requestAnimationFrame(fitToContent);
+    }
+
+    btnZoomIn.onclick = (e) => {
+        e.stopPropagation();
+        if (zoomIdx < ZOOM_STEPS.length - 1) { zoomIdx++; applyCardZoom(); }
+    };
+    btnZoomOut.onclick = (e) => {
+        e.stopPropagation();
+        if (zoomIdx > 0) { zoomIdx--; applyCardZoom(); }
+    };
 
     // Card deck
     const deck = document.createElement("div");
@@ -102,7 +178,11 @@ function setupPickerUI(node) {
     const selectedInfo = document.createElement("span");
     selectedInfo.className = "h3lvm-selected";
     selectedInfo.textContent = `选中: #${segmentWidget?.value || 1}`;
+    const hintText = document.createElement("span");
+    hintText.className = "h3lvm-hint";
+    hintText.textContent = "👉 点选片段";
     footer.appendChild(selectedInfo);
+    footer.appendChild(hintText);
     container.appendChild(footer);
 
     // Add as DOM widget
@@ -110,6 +190,8 @@ function setupPickerUI(node) {
         serialize: false,
         hideOnZoom: false,
     });
+
+    node.imgs = null;
 
     // Minimum width
     if (node.size[0] < 420) node.setSize([420, node.size[1]]);
@@ -153,7 +235,6 @@ function setupPickerUI(node) {
                 if (seg.thumbnail_url) {
                     const img = document.createElement("img");
                     img.className = "h3lvm-thumb";
-                    // Add cache-buster so new content shows after re-save
                     const sep = seg.thumbnail_url.includes("?") ? "&" : "?";
                     img.src = seg.thumbnail_url + sep + "_t=" + Date.now();
                     img.loading = "lazy";
@@ -202,7 +283,6 @@ function setupPickerUI(node) {
                         segmentWidget.value = seg.segment_id;
                         segmentWidget.callback?.(seg.segment_id);
                     }
-                    // Update active state
                     deck.querySelectorAll(".h3lvm-card").forEach(c => c.classList.remove("active"));
                     deck.querySelectorAll(".h3lvm-active-badge").forEach(b => b.remove());
                     card.classList.add("active");
@@ -228,13 +308,19 @@ function setupPickerUI(node) {
     // --- Fit node to content ---
     function fitToContent() {
         requestAnimationFrame(() => {
-            const deckH = Math.min(deck.scrollHeight || 0, 280);
-            if (deckH === 0) return;
-            const stdW = (node.widgets || []).filter(w => w.type !== "custom");
-            const stdH = stdW.length * 28;
-            const CHROME = 130;
-            const target = Math.max(stdH + deckH + CHROME, 160);
-            if (Math.abs(node.size[1] - target) > 5) {
+            const containerH = container.offsetHeight || 0;
+            if (containerH === 0) return;
+
+            const stdWidgetsH = (node.widgets || []).filter(w => w.type !== "custom").length * 28;
+            const inputsH = (node.inputs || []).length * 20;
+            const outputsH = (node.outputs || []).length * 20;
+            const TITLE = 28;
+            const BOTTOM_PAD = 6;
+
+            const target = TITLE + inputsH + outputsH + stdWidgetsH + containerH + BOTTOM_PAD;
+
+            // Only shrink (never grow) — user may intentionally make node bigger
+            if (node.size[1] > target + 4) {
                 node.setSize([node.size[0], target]);
             }
         });
@@ -242,7 +328,6 @@ function setupPickerUI(node) {
 
     // --- MP4 Preview Modal ---
     function openPreview(seg, project) {
-        // Remove existing
         const existing = document.getElementById("h3lvm-preview-overlay");
         if (existing) existing.remove();
 
