@@ -9,16 +9,10 @@ Namespace isolation: uses /h3_lvm/* (clipstream uses /minimax/clip_bin/*).
 from __future__ import annotations
 
 import logging
-import sys
-import os
 
 logger = logging.getLogger(__name__)
 
-# Ensure the plugin root is importable
-_PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PLUGIN_ROOT not in sys.path:
-    sys.path.insert(0, _PLUGIN_ROOT)
-
+# RAFOLIE 2026-09-28: package-relative imports; no global search path changes.
 from .segment_store import list_project, list_projects, sanitize_project_name, DEFAULT_PROJECT
 
 

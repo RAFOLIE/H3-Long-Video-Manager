@@ -1,8 +1,4 @@
 """ComfyUI H3 Long Video Manager — Custom Node Plugin."""
 
-from .nodes import (
-    NODE_CLASS_MAPPINGS,
-    NODE_DISPLAY_NAME_MAPPINGS,
-)
-
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+# Nodes are imported by the root V3 extension. Keep storage utilities usable
+# independently (including the upstream storage tests).

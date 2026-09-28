@@ -7,107 +7,24 @@ v3 changes:
 - Save failures are non-fatal (loud warning, node still produces output)
 """
 
-import sys
-import os
+# Modified by RAFOLIE on 2026-09-28: native ComfyUI V3 schema and execution.
+from comfy_api.latest import io
+
 import logging
-
-logger = logging.getLogger(__name__)
-
-_PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _PLUGIN_ROOT not in sys.path:
-    sys.path.insert(0, _PLUGIN_ROOT)
-
 import torch
 
-try:
-    from core.models import (
-        MotionContextConfig,
-        MOTION_CONTEXT_OPTIONS,
-        SourceVideoInfo,
-        WorkingVideoConfig,
-    )
-    from core.manifest import build_manifest
-    from core.h3_grid import is_valid_h3_frame_count, align_down_to_h3_grid, align_up_to_h3_grid
-    from core.person_crop import crop_video_to_person
-    CORE_AVAILABLE = True
-    print("[H3 Long Video Manager] Core imported successfully")
-except ImportError as e:
-    CORE_AVAILABLE = False
-    print(f"[H3 Long Video Manager] Core import FAILED: {e}")
-    import traceback
-    traceback.print_exc()
+from ..core.models import MotionContextConfig, MOTION_CONTEXT_OPTIONS, SourceVideoInfo, WorkingVideoConfig
+from ..core.manifest import build_manifest
+from ..core.h3_grid import is_valid_h3_frame_count, align_down_to_h3_grid, align_up_to_h3_grid
+from ..core.person_crop import crop_video_to_person
+from .segment_store import (
+    save_segment as _save_segment, load_segment, load_project_index,
+    list_project, list_projects, sanitize_project_name, DEFAULT_PROJECT,
+)
 
-    class MotionContextConfig:
-        def __init__(self, context_frames=22):
-            self.context_frames = context_frames
-
-    MOTION_CONTEXT_OPTIONS = (5, 22, 39, 56)
-    SourceVideoInfo = None
-    WorkingVideoConfig = None
-
-    def build_manifest(*a, **kw):
-        raise RuntimeError("Core module not available")
-
-    def is_valid_h3_frame_count(n):
-        return n >= 5 and (n - 5) % 17 == 0
-
-    def align_down_to_h3_grid(n):
-        if n <= 5:
-            return 5
-        k = (n - 5) // 17
-        return 17 * k + 5
-
-    def align_up_to_h3_grid(n):
-        if n <= 5:
-            return 5
-        k = (n - 5 + 16) // 17
-        return 17 * k + 5
-
-    def crop_video_to_person(video, expand_percent=0.0, sample_count=16):
-        print("[H3 LVM] person_crop unavailable (core import failed), skip")
-        return video, None
-
-# --- Segment store import (Phase A + B) ---
-try:
-    from .segment_store import (
-        save_segment as _save_segment,
-        load_segment,
-        load_project_index,
-        list_project,
-        list_projects,
-        sanitize_project_name,
-        DEFAULT_PROJECT,
-    )
-    STORE_AVAILABLE = True
-except ImportError:
-    try:
-        import segment_store
-        _save_segment = segment_store.save_segment
-        load_segment = segment_store.load_segment
-        load_project_index = segment_store.load_project_index
-        list_project = segment_store.list_project
-        list_projects = segment_store.list_projects
-        sanitize_project_name = segment_store.sanitize_project_name
-        DEFAULT_PROJECT = segment_store.DEFAULT_PROJECT
-        STORE_AVAILABLE = True
-    except ImportError:
-        STORE_AVAILABLE = False
-        print("[H3 Long Video Manager] segment_store not available (save/pick disabled)")
-        _save_segment = None
-        DEFAULT_PROJECT = "H3_LVM"
-
-        def load_segment(*a, **kw):
-            raise RuntimeError("segment_store not available")
-
-        def load_project_index(*a, **kw):
-            return {"total_segments": 0, "segments": []}
-
-        def list_projects():
-            return []
-
-        def sanitize_project_name(name):
-            s = str(name).strip() if name else ""
-            return s or DEFAULT_PROJECT
+logger = logging.getLogger(__name__)
+CORE_AVAILABLE = True
+STORE_AVAILABLE = True
 
 
 def _slice_and_scale(
@@ -221,7 +138,7 @@ def _resample_frames(video: torch.Tensor, target_frames: int) -> torch.Tensor:
     return video[indices].contiguous()
 
 
-class H3LongVideoManager:
+class H3LongVideoManager(io.ComfyNode):
     """H3 Long Video Manager — extract H3-compatible segments from video + audio.
 
     v3: saves all segments to the H3 Segment Bin, outputs selected segment live.
@@ -231,34 +148,38 @@ class H3LongVideoManager:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "video": ("IMAGE",),
-                "fps": ("INT", {"default": 24, "min": 1, "max": 240, "placeholder": "源视频帧率，用于时长和音频计算"}),
-                "segment_duration": ("FLOAT", {"default": 6.0, "min": 0.5, "max": 120.0, "step": 0.001}),
-                "motion_context_frames": (["0", "5", "22", "39", "56"], {"default": "22"}),
-                "segment_id": ("INT", {"default": 1, "min": 1, "max": 999}),
-            },
-            "optional": {
-                "audio": ("AUDIO",),
-                "scale_percent": ("FLOAT", {"default": 100.0, "min": 10.0, "max": 100.0, "step": 1.0}),
-                "align_to_h3_grid": ("BOOLEAN", {"default": True}),
-                "project_name": ("STRING", {"default": DEFAULT_PROJECT, "placeholder": "留空 → 默认库：H3_LVM"}),
-                "save_enabled": ("BOOLEAN", {"default": True}),
-                "save_preview_mp4": ("BOOLEAN", {"default": False}),
-                "final_align": (["down", "up"], {"default": "down"}),
-                "person_crop": ("BOOLEAN", {"default": False, "tooltip": "开启后检测人物并裁掉边缘，让人物占画面更大"}),
-                "person_crop_expand_percent": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1, "tooltip": "人物框外扩百分比，0 为紧贴检测框（仍保持原画面比例）"}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id='H3 Long Video Manager',
+            display_name='H3 Long Video Manager',
+            category='H3/Video',
+            inputs=[
+                io.Image.Input('video'),
+                io.Int.Input('fps', default=24, min=1, max=240, tooltip='源视频帧率，用于时长和音频计算'),
+                io.Float.Input('segment_duration', default=6.0, min=0.5, max=120.0, step=0.001),
+                io.Combo.Input('motion_context_frames', options=['0', '5', '22', '39', '56'], default='22'),
+                io.Int.Input('segment_id', default=1, min=1, max=999),
+                io.Audio.Input('audio', optional=True),
+                io.Float.Input('scale_percent', optional=True, default=100.0, min=10.0, max=100.0, step=1.0),
+                io.Boolean.Input('align_to_h3_grid', optional=True, default=True),
+                io.String.Input('project_name', optional=True, default=DEFAULT_PROJECT, placeholder='留空 → 默认库：H3_LVM'),
+                io.Boolean.Input('save_enabled', optional=True, default=True),
+                io.Boolean.Input('save_preview_mp4', optional=True, default=False),
+                io.Combo.Input('final_align', options=['down', 'up'], optional=True, default='down'),
+                io.Boolean.Input('person_crop', optional=True, default=False, tooltip='开启后检测人物并裁掉边缘，让人物占画面更大'),
+                io.Int.Input('person_crop_expand_percent', optional=True, default=0, min=0, max=100, step=1, tooltip='人物框外扩百分比，0 为紧贴检测框（仍保持原画面比例）'),
+            ],
+            outputs=[
+                io.Image.Output(display_name='IMAGE'),
+                io.Audio.Output(display_name='AUDIO'),
+                io.Int.Output(display_name='frame_count'),
+                io.Int.Output(display_name='total_segments'),
+            ],
+        )
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "INT", "INT")
-    RETURN_NAMES = ("IMAGE", "AUDIO", "frame_count", "total_segments")
-    FUNCTION = "process"
-    CATEGORY = "H3/Video"
 
-    def process(self, video, fps, segment_duration, motion_context_frames, segment_id,
+    @classmethod
+    def execute(cls, video, fps, segment_duration, motion_context_frames, segment_id,
                 audio=None, scale_percent=100.0, align_to_h3_grid=True,
                 project_name=DEFAULT_PROJECT, save_enabled=True, save_preview_mp4=False,
                 final_align="down", person_crop=False, person_crop_expand_percent=0):
@@ -462,10 +383,10 @@ class H3LongVideoManager:
             duration_sec = wf.shape[-1] / result_audio["sample_rate"]
             print(f"[H3 LVM] output audio: {duration_sec:.3f}s, {wf.shape[-1]} samples @ {result_audio['sample_rate']}Hz")
 
-        return (result_video, result_audio, final_frame_count, total_segments)
+        return io.NodeOutput(result_video, result_audio, final_frame_count, total_segments)
 
 
-class H3SegmentPicker:
+class H3SegmentPicker(io.ComfyNode):
     """H3 Segment Picker — load a saved segment from the H3 Segment Bin.
 
     No video input needed. Reads the tensor bundle (safetensors) saved by
@@ -475,20 +396,30 @@ class H3SegmentPicker:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "project_name": ("STRING", {"default": DEFAULT_PROJECT, "placeholder": "库名（默认 H3_LVM）"}),
-                "segment_id": ("INT", {"default": 1, "min": 1, "max": 999}),
-            },
-        }
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id='H3 Segment Picker',
+            display_name='H3 Segment Picker',
+            category='H3/Video',
+            inputs=[
+                io.String.Input('project_name', default=DEFAULT_PROJECT, placeholder='库名（默认 H3_LVM）'),
+                io.Int.Input('segment_id', default=1, min=1, max=999),
+            ],
+            outputs=[
+                io.Image.Output(display_name='IMAGE'),
+                io.Audio.Output(display_name='AUDIO'),
+                io.Int.Output(display_name='frame_count'),
+            ],
+        )
 
-    RETURN_TYPES = ("IMAGE", "AUDIO", "INT")
-    RETURN_NAMES = ("IMAGE", "AUDIO", "frame_count")
-    FUNCTION = "process"
-    CATEGORY = "H3/Video"
 
-    def process(self, project_name, segment_id):
+    @classmethod
+    def fingerprint_inputs(cls, **kwargs):
+        # The selected slot may be overwritten without changing widget values.
+        return float("nan")
+
+    @classmethod
+    def execute(cls, project_name, segment_id):
         if not STORE_AVAILABLE:
             raise RuntimeError("segment_store module not available. Cannot load saved segments.")
 
@@ -527,17 +458,11 @@ class H3SegmentPicker:
             audio = {"waveform": torch.zeros(1, 1, max(1, int(duration_sec * 44100))), "sample_rate": 44100}
             print(f"[H3 LVM Picker] no audio saved, generating silent: {duration_sec:.2f}s")
 
-        return (video, audio, frame_count)
+        return io.NodeOutput(video, audio, frame_count)
 
 
-NODE_CLASS_MAPPINGS = {
-    "H3 Long Video Manager": H3LongVideoManager,
-    "H3 Segment Picker": H3SegmentPicker,
-}
+NODE_LIST = [H3LongVideoManager, H3SegmentPicker]
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "H3 Long Video Manager": "H3 Long Video Manager",
-    "H3 Segment Picker": "H3 Segment Picker",
-}
 
-print("[H3 Long Video Manager] Plugin loaded (v3: +save bin +picker)")
+
+print("[H3 Long Video Manager] Plugin loaded (ComfyUI V3 API)")

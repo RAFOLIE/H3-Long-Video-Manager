@@ -114,12 +114,13 @@ class TestMotionContext(unittest.TestCase):
         self.assertEqual(mc.context_end(0), 0)
 
     def test_all_valid_mc_values(self):
-        for v in (5, 22, 39, 56):
+        # RAFOLIE 2026-09-28: zero disables context in the current upstream model.
+        for v in (0, 5, 22, 39, 56):
             mc = MotionContextConfig(context_frames=v)
             self.assertEqual(mc.context_frames, v)
 
     def test_invalid_mc_value(self):
-        for v in (0, 10, 100, -5):
+        for v in (10, 100, -5):
             with self.assertRaises(ValueError):
                 MotionContextConfig(context_frames=v)
 

@@ -308,3 +308,11 @@
     background: #334155;
     color: #fff;
 }
+
+/* RAFOLIE 2026-09-28: responsive DOM layout, scoped to this plugin. */
+.h3lvm-container { margin: 0; min-width: 0; min-height: 0; }
+.h3lvm-header { flex-wrap: wrap; gap: 6px; flex: 0 0 auto; }
+.h3lvm-deck { flex: 1 1 0; min-height: 0; min-width: 0;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--card-min, 150px)), 1fr)); }
+.h3lvm-footer { flex: 0 0 auto; flex-wrap: wrap; overflow-wrap: anywhere; }
+.h3lvm-container img { max-width: 100%; }

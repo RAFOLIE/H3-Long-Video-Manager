@@ -1,3 +1,5 @@
+// Modified by RAFOLIE 2026-09-28: Nodes 2.0 DOM layout and lifecycle.
+import { addPanel } from "./dom_panel.js";
 /**
  * H3 Long Video Manager — Segment Picker Frontend (Phase B2)
  *
@@ -54,6 +56,8 @@ app.registerExtension({
             }
             try {
                 setupPickerUI(this);
+                // Initial size only; workflow configure restores saved user sizing.
+                this.setSize([Math.max(this.size[0], 620), Math.max(this.size[1], 460)]);
             } catch (e) {
                 console.warn("[H3 LVM] UI setup failed (node still functional):", e);
             }
@@ -64,7 +68,7 @@ app.registerExtension({
         nodeType.prototype.onConfigure = function () {
             const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
             this.imgs = null;
-            this._h3lvm_gallery = null;
+            this._h3lvmRefresh?.();
             return r;
         };
 
@@ -72,6 +76,7 @@ app.registerExtension({
         nodeType.prototype.onExecuted = function (message) {
             const r = onExecuted ? onExecuted.apply(this, arguments) : undefined;
             this.imgs = null;
+            this._h3lvmRefresh?.();
             return r;
         };
 
@@ -186,10 +191,7 @@ function setupPickerUI(node) {
     container.appendChild(footer);
 
     // Add as DOM widget
-    node.addDOMWidget("h3lvm_gallery", "gallery", container, {
-        serialize: false,
-        hideOnZoom: false,
-    });
+    const { signal } = addPanel(node, "h3lvm_gallery", container);
 
     node.imgs = null;
 
@@ -197,9 +199,13 @@ function setupPickerUI(node) {
     if (node.size[0] < 420) node.setSize([420, node.size[1]]);
 
     // --- Load segments ---
+    let requestId = 0;
     async function loadSegments() {
+        if (signal.aborted) return;
+        const currentRequest = ++requestId;
         const project = projectWidget?.value || "H3_LVM";
         projectTag.textContent = project;
+        selectedInfo.textContent = `选中: #${segmentWidget?.value || 1}`;
 
         try {
             const cacheBust = Date.now();
@@ -209,6 +215,7 @@ function setupPickerUI(node) {
                 return;
             }
             const data = await res.json();
+            if (signal.aborted || currentRequest !== requestId) return;
             const segments = data.segments || [];
 
             if (segments.length === 0) {
@@ -307,23 +314,8 @@ function setupPickerUI(node) {
 
     // --- Fit node to content ---
     function fitToContent() {
-        requestAnimationFrame(() => {
-            const containerH = container.offsetHeight || 0;
-            if (containerH === 0) return;
-
-            const stdWidgetsH = (node.widgets || []).filter(w => w.type !== "custom").length * 28;
-            const inputsH = (node.inputs || []).length * 20;
-            const outputsH = (node.outputs || []).length * 20;
-            const TITLE = 28;
-            const BOTTOM_PAD = 6;
-
-            const target = TITLE + inputsH + outputsH + stdWidgetsH + containerH + BOTTOM_PAD;
-
-            // Only shrink (never grow) — user may intentionally make node bigger
-            if (node.size[1] > target + 4) {
-                node.setSize([node.size[0], target]);
-            }
-        });
+        // Layout is owned by ComfyUI; refreshing cards must not shrink the node.
+        node.setDirtyCanvas?.(true, true);
     }
 
     // --- MP4 Preview Modal ---
@@ -378,11 +370,24 @@ function setupPickerUI(node) {
     if (projectWidget) {
         const origCallback = projectWidget.callback;
         projectWidget.callback = (val) => {
-            origCallback?.(val);
+            origCallback?.call(projectWidget, val);
             loadSegments();
         };
     }
 
-    // Initial load
+    if (segmentWidget) {
+        const original = segmentWidget.callback;
+        segmentWidget.callback = function () {
+            const result = original?.apply(this, arguments);
+            loadSegments();
+            return result;
+        };
+    }
+
+    node._h3lvmRefresh = loadSegments;
+    signal.addEventListener("abort", () => { delete node._h3lvmRefresh; }, { once: true });
+    const onExecuted = () => loadSegments();
+    api.addEventListener("execution_success", onExecuted);
+    signal.addEventListener("abort", () => api.removeEventListener("execution_success", onExecuted), { once: true });
     loadSegments();
 }
