@@ -32,6 +32,9 @@ import subprocess
 import tempfile
 import threading
 import wave
+from functools import wraps
+import inspect
+from .asset_paths import checked_asset_dir, preview_url
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,7 +47,7 @@ INDEX_NAME = "h3lvm_index.json"
 DEFAULT_PROJECT = "H3_LVM"
 
 _base_dir_override: Optional[str] = None
-_project_locks: Dict[str, threading.Lock] = {}
+_project_locks: Dict[str, threading.RLock] = {}
 _locks_guard = threading.Lock()
 
 
@@ -92,11 +95,12 @@ def get_project_dir(project: Any, create: bool = True) -> str:
     return pdir
 
 
-def _project_lock(name: str) -> threading.Lock:
+def _project_lock(name: str):
+    name = os.path.normcase(os.path.realpath(get_project_dir(name, create=False)))
     with _locks_guard:
         lock = _project_locks.get(name)
         if lock is None:
-            lock = threading.Lock()
+            lock = threading.RLock()
             _project_locks[name] = lock
         return lock
 
@@ -104,6 +108,31 @@ def _project_lock(name: str) -> threading.Lock:
 # ---------------------------------------------------------------------------
 # Tensor helpers
 # ---------------------------------------------------------------------------
+
+def project_locked(fn):
+    signature = inspect.signature(fn)
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        with _project_lock(sanitize_project_name(bound.arguments["project"])):
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+def _write_index(project, idx):
+    pdir = get_project_dir(project)
+    fd, temp = tempfile.mkstemp(prefix=".index_", dir=pdir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(idx, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, os.path.join(pdir, INDEX_NAME))
+    finally:
+        if os.path.exists(temp):
+            os.remove(temp)
+
 
 def tensor_to_pil(frame: torch.Tensor):
     """Convert [H,W,C] or [1,H,W,C] float [0,1] tensor to PIL RGB Image."""
@@ -215,6 +244,7 @@ def _encode_mp4(images: torch.Tensor, audio: Optional[Dict[str, Any]], fps: int,
 # Save / list / load
 # ---------------------------------------------------------------------------
 
+@project_locked
 def save_segment(
     project: Any,
     seg_index_1based: int,
@@ -231,10 +261,10 @@ def save_segment(
     """
     project = sanitize_project_name(project)
     tag = f"seg{int(seg_index_1based):02d}"
-    sdir = os.path.join(get_project_dir(project), tag)
+    sdir = checked_asset_dir(get_base_dir(), get_project_dir(project), tag)
     # Clean slate: remove old segment data to avoid stale files (e.g. leftover mp4)
     if os.path.isdir(sdir):
-        shutil.rmtree(sdir, ignore_errors=True)
+        shutil.rmtree(sdir)
     os.makedirs(sdir, exist_ok=True)
 
     # --- tensors (lossless, feed H3 directly) ---
@@ -311,6 +341,7 @@ def save_segment(
     return seg_meta
 
 
+@project_locked
 def load_segment(project: Any, seg_index_1based: int) -> Tuple[torch.Tensor, Optional[Dict[str, Any]], Dict[str, Any]]:
     """Load a saved segment -> (video_tensor, audio_dict, meta)."""
     project = sanitize_project_name(project)
@@ -342,6 +373,7 @@ def load_segment(project: Any, seg_index_1based: int) -> Tuple[torch.Tensor, Opt
     return video, audio, meta
 
 
+@project_locked
 def load_project_index(project: Any) -> Dict[str, Any]:
     pdir = get_project_dir(project, create=False)
     p = os.path.join(pdir, INDEX_NAME)
@@ -377,10 +409,10 @@ def _upsert_index(project: str, seg_meta: Dict[str, Any]) -> None:
     idx["total_segments"] = len(segs)
     idx["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     idx["project_name"] = project
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(idx, f, ensure_ascii=False, indent=2)
+    _write_index(project, idx)
 
 
+@project_locked
 def list_project(project: Any) -> Dict[str, Any]:
     """Return the project index enriched with /view URLs (for the frontend)."""
     project = sanitize_project_name(project)
@@ -394,13 +426,13 @@ def list_project(project: Any) -> Dict[str, Any]:
 
         thumb = seg.get("thumbnail", "")
         if thumb and os.path.isfile(os.path.join(pdir, d, thumb)):
-            seg["thumbnail_url"] = f"/view?filename={thumb}&subfolder={sub}&type=output"
+            seg["thumbnail_url"] = preview_url(os.path.join(pdir, d, thumb), sub)
         else:
             seg["thumbnail_url"] = ""
 
         mp4 = seg.get("mp4", "")
         if mp4 and os.path.isfile(os.path.join(pdir, d, mp4)):
-            seg["mp4_url"] = f"/view?filename={mp4}&subfolder={sub}&type=output"
+            seg["mp4_url"] = preview_url(os.path.join(pdir, d, mp4), sub)
             seg["has_mp4"] = True
         else:
             seg["mp4_url"] = ""
@@ -420,22 +452,29 @@ def list_projects() -> List[str]:
     return sorted(out)
 
 
+@project_locked
 def delete_segment(project: Any, seg_index_1based: int) -> bool:
     """Remove a saved segment (files + index entry). Returns True if removed."""
-    import shutil as _sh
     project = sanitize_project_name(project)
-    tag = f"seg{int(seg_index_1based):02d}"
-    sdir = os.path.join(get_project_dir(project, create=False), tag)
-    if not os.path.isdir(sdir):
+    if isinstance(seg_index_1based, bool) or not isinstance(seg_index_1based, int) or seg_index_1based < 1:
+        raise ValueError("segment_id must be a positive integer")
+    tag = f"seg{seg_index_1based:02d}"
+    sdir = checked_asset_dir(get_base_dir(), get_project_dir(project, create=False), tag)
+    idx = load_project_index(project)
+    found = any(s.get("segment_id") == seg_index_1based for s in idx.get("segments", []))
+    if not found:
         return False
-    with _project_lock(project):
-        _sh.rmtree(sdir, ignore_errors=True)
-        idx = load_project_index(project)
-        idx["segments"] = [s for s in idx.get("segments", []) if s.get("segment_id") != int(seg_index_1based)]
-        idx["total_segments"] = len(idx["segments"])
-        p = os.path.join(get_project_dir(project, create=True), INDEX_NAME)
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(idx, f, ensure_ascii=False, indent=2)
+    previous = dict(idx)
+    idx["segments"] = [s for s in idx.get("segments", []) if s.get("segment_id") != seg_index_1based]
+    idx["total_segments"] = len(idx["segments"])
+    idx["last_updated"] = datetime.now().isoformat()
+    _write_index(project, idx)
+    try:
+        if os.path.exists(sdir):
+            shutil.rmtree(sdir)  # Never hide permission / in-use errors from the UI.
+    except OSError:
+        _write_index(project, previous)
+        raise
     return True
 
 

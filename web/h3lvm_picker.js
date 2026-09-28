@@ -1,4 +1,5 @@
 // Modified by RAFOLIE 2026-09-28: Nodes 2.0 DOM layout and lifecycle.
+import { addDeleteButton } from "./delete_button.js";
 import { addPanel } from "./dom_panel.js";
 /**
  * H3 Long Video Manager — Segment Picker Frontend (Phase B2)
@@ -200,7 +201,7 @@ function setupPickerUI(node) {
 
     // --- Load segments ---
     let requestId = 0;
-    async function loadSegments() {
+    async function loadSegments(deletedId = null) {
         if (signal.aborted) return;
         const currentRequest = ++requestId;
         const project = projectWidget?.value || "H3_LVM";
@@ -208,8 +209,8 @@ function setupPickerUI(node) {
         selectedInfo.textContent = `选中: #${segmentWidget?.value || 1}`;
 
         try {
-            const cacheBust = Date.now();
-            const res = await api.fetchApi(`/h3_lvm/segments?project=${encodeURIComponent(project)}&_t=${cacheBust}`);
+            const res = await api.fetchApi(`/h3_lvm/segments?project=${encodeURIComponent(project)}`, { cache: "no-store" });
+            if (signal.aborted || currentRequest !== requestId) return;
             if (!res.ok) {
                 deck.innerHTML = `<div class="h3lvm-empty">API 错误: ${res.status}</div>`;
                 return;
@@ -217,8 +218,17 @@ function setupPickerUI(node) {
             const data = await res.json();
             if (signal.aborted || currentRequest !== requestId) return;
             const segments = data.segments || [];
+            if (deletedId != null && Number(segmentWidget?.value) === Number(deletedId)) {
+                segmentWidget.value = segments[0]?.segment_id || 1;
+                selectedInfo.textContent = segments.length ? `选中: #${segmentWidget.value}` : "暂无可选片段";
+                node.setDirtyCanvas?.(true, true);
+            }
+            if (segments.length && !segments.some(seg => seg.segment_id === Number(segmentWidget?.value))) {
+                selectedInfo.textContent = `#${segmentWidget?.value} 不存在，请重新选择`;
+            }
 
             if (segments.length === 0) {
+                selectedInfo.textContent = "暂无可选片段";
                 deck.innerHTML = `<div class="h3lvm-empty">
                     <div>📭 该库暂无已保存片段</div>
                     <div class="h3lvm-empty-hint">先用 H3 Long Video Manager 节点裁切并保存</div>
@@ -242,8 +252,7 @@ function setupPickerUI(node) {
                 if (seg.thumbnail_url) {
                     const img = document.createElement("img");
                     img.className = "h3lvm-thumb";
-                    const sep = seg.thumbnail_url.includes("?") ? "&" : "?";
-                    img.src = seg.thumbnail_url + sep + "_t=" + Date.now();
+                    img.src = seg.thumbnail_url;
                     img.loading = "lazy";
                     thumbWrap.appendChild(img);
                 } else {
@@ -282,6 +291,24 @@ function setupPickerUI(node) {
                     <div class="h3lvm-seg-label">Seg #${seg.segment_id}</div>
                     <div class="h3lvm-seg-info">${seg.frames}帧 | ${dur} | ${res}</div>
                 `;
+                addDeleteButton(meta, {
+                    description: `项目「${project}」的 Seg #${seg.segment_id}`,
+                    signal,
+                    onDelete: async () => {
+                        document.getElementById("h3lvm-preview-overlay")?._h3Close?.();
+                        const response = await api.fetchApi("/h3_lvm/delete", {
+                            method: "POST", headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ project, segment_id: seg.segment_id }),
+                        });
+                        if (!response.ok) {
+                            const error = await response.json().catch(() => ({}));
+                            throw new Error(error.error || `删除失败 (${response.status})；请确认已重启 ComfyUI。`);
+                        }
+                        if (!signal.aborted && (projectWidget?.value || "H3_LVM") === project) {
+                            await loadSegments(seg.segment_id);
+                        }
+                    },
+                });
                 card.appendChild(meta);
 
                 // Click to select
@@ -307,6 +334,7 @@ function setupPickerUI(node) {
             fitToContent();
 
         } catch (e) {
+            if (signal.aborted || currentRequest !== requestId) return;
             console.warn("[H3 LVM] Failed to load segments:", e);
             deck.innerHTML = `<div class="h3lvm-empty">加载失败: ${e.message}</div>`;
         }
@@ -321,7 +349,7 @@ function setupPickerUI(node) {
     // --- MP4 Preview Modal ---
     function openPreview(seg, project) {
         const existing = document.getElementById("h3lvm-preview-overlay");
-        if (existing) existing.remove();
+        if (existing) existing._h3Close?.();
 
         const overlay = document.createElement("div");
         overlay.id = "h3lvm-preview-overlay";
@@ -353,10 +381,14 @@ function setupPickerUI(node) {
 
         function close() {
             video.pause();
-            video.src = "";
+            video.removeAttribute("src");
+            video.load();
             overlay.remove();
             window.removeEventListener("keydown", onKey);
+            signal.removeEventListener("abort", close);
         }
+        overlay._h3Close = close;
+        signal.addEventListener("abort", close, { once: true });
         function onKey(e) { if (e.key === "Escape") close(); }
         closeBtn.onclick = close;
         overlay.onclick = (e) => { if (e.target === overlay) close(); };
@@ -384,6 +416,13 @@ function setupPickerUI(node) {
         };
     }
 
+    const onDeleted = event => {
+        if (event.detail?.project === (projectWidget?.value || "H3_LVM")) {
+            loadSegments(event.detail.deleted_id);
+        }
+    };
+    api.addEventListener("h3_lvm/changed", onDeleted);
+    signal.addEventListener("abort", () => api.removeEventListener("h3_lvm/changed", onDeleted), { once: true });
     node._h3lvmRefresh = loadSegments;
     signal.addEventListener("abort", () => { delete node._h3lvmRefresh; }, { once: true });
     const onExecuted = () => loadSegments();

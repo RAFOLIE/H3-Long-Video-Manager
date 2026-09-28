@@ -4,7 +4,7 @@ v3 changes:
 - Added project_name / save_enabled / save_preview_mp4 widgets
 - Save-all loop: every segment is sliced once, saved to the H3 Segment Bin
 - Live output remains the selected segment (backward compatible)
-- Save failures are non-fatal (loud warning, node still produces output)
+- Save failures are reported as node errors; a completed run means all segments were saved.
 """
 
 # Modified by RAFOLIE on 2026-09-28: native ComfyUI V3 schema and execution.
@@ -146,6 +146,12 @@ class H3LongVideoManager(io.ComfyNode):
     Input:  IMAGE tensor [F,H,W,C] + AUDIO dict + source FPS
     Output: IMAGE tensor (selected segment) + AUDIO dict (matched) + INT frame_count + INT total_segments
     """
+
+    @classmethod
+    def fingerprint_inputs(cls, save_enabled=True, **kwargs):
+        # Saving is a disk side effect: a cached output cannot recreate deleted assets.
+        # Pure live processing retains the normal ComfyUI input cache.
+        return float("nan") if save_enabled else False
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -318,13 +324,19 @@ class H3LongVideoManager(io.ComfyNode):
                         },
                     )
                 except Exception as e:
-                    print(f"[H3 LVM] WARNING: failed to save segment {seg_id_1based}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    raise RuntimeError(
+                        f"H3 LVM: 保存项目 '{project}' 的片段 #{seg_id_1based} 失败。"
+                        "请检查磁盘空间、写入权限或文件占用；本次保存未完成。"
+                    ) from e
 
             print(f"[H3 LVM] save complete: {total_segments} segments → '{project}'")
+            # Refresh other Picker nodes even if a downstream node later fails.
+            import server
+            prompt_server = getattr(server.PromptServer, "instance", None)
+            if prompt_server is not None:
+                prompt_server.send_sync("h3_lvm/changed", {"project": project})
         elif save_enabled and not STORE_AVAILABLE:
-            print("[H3 LVM] WARNING: segment_store not available, skipping save.")
+            raise RuntimeError("H3 LVM: 素材存储模块不可用，无法保存片段。")
         else:
             print("[H3 LVM] save disabled (pure live mode)")
 
@@ -439,9 +451,10 @@ class H3SegmentPicker(io.ComfyNode):
                 f"Run the H3 Long Video Manager node first to save segments."
             )
 
-        if segment_id < 1 or segment_id > total:
+        available = [s.get("segment_id") for s in idx.get("segments", [])]
+        if segment_id not in available:
             raise ValueError(
-                f"segment_id={segment_id} out of range [1, {total}] for project '{project}'."
+                f"segment_id={segment_id} is not saved in project '{project}'. Available IDs: {available}"
             )
 
         # Load
